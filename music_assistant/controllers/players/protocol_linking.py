@@ -672,8 +672,19 @@ class ProtocolLinkingMixin:
 
             # Move cached-only protocol ownership as well so old-parent cleanup
             # does not wipe protocols that were intentionally preserved.
+            # Track active protocols that are temporarily offline or mid-discovery
+            not_registered_active_ids = {
+                pid for pid in active_protocol_ids if not self.get_player(pid)
+            }
+
             cached_only_ids = known_protocol_ids - active_protocol_ids
-            preserved_protocol_ids = moved_protocol_ids | cached_only_ids
+            preserved_protocol_ids = (
+                moved_protocol_ids | cached_only_ids | not_registered_active_ids
+            )
+
+            # Prevent the keeper player from linking to itself
+            preserved_protocol_ids.discard(keep.player_id)
+
             self._migrate_protocol_ids_to_parent(keep, preserved_protocol_ids)
             self._remove_protocol_ids_from_parent(remove, preserved_protocol_ids)
 
@@ -849,8 +860,19 @@ class ProtocolLinkingMixin:
                         moved_protocol_ids.add(protocol_player.player_id)
                         protocol_player.update_state()
 
+            # Track active protocols that are temporarily offline or mid-discovery
+            not_registered_active_ids = {
+                pid for pid in active_protocol_ids if not self.get_player(pid)
+            }
+
             cached_only_ids = known_protocol_ids - active_protocol_ids
-            preserved_protocol_ids = moved_protocol_ids | cached_only_ids
+            preserved_protocol_ids = (
+                moved_protocol_ids | cached_only_ids | not_registered_active_ids
+            )
+
+            # Prevent the parent player from linking to itself
+            preserved_protocol_ids.discard(native_player.player_id)
+
             self._migrate_protocol_ids_to_parent(native_player, preserved_protocol_ids)
             self._remove_protocol_ids_from_parent(player, preserved_protocol_ids)
             native_player.update_state()
@@ -891,6 +913,16 @@ class ProtocolLinkingMixin:
         # Guard: refuse to replace an existing active link from the same domain.
         # This prevents a second instance of the same protocol (e.g., two AirPlay
         # instances on the same host) from silently replacing the first one.
+        # --- GUARD START ---
+        # Refuse to link a player to itself
+        if native_player.player_id == protocol_player.player_id:
+            self.logger.debug(
+                "Refusing to link player %s to itself as a protocol",
+                native_player.player_id,
+            )
+            return
+        # --- GUARD END ---
+
         if self._parent_has_active_protocol_from_domain(
             native_player, protocol_domain, exclude_player_id=protocol_player.player_id
         ):
@@ -1144,20 +1176,36 @@ class ProtocolLinkingMixin:
             # since disabled/inactive protocols may only exist in the cached parent data.
             all_protocol_ids = set(self._get_known_protocol_ids(player))
             for protocol_id in all_protocol_ids:
+                # --- FIX START ---
+                # Check if this protocol player has already been migrated to a different parent.
+                # If its cached parent ID points to someone else, skip the cleanup.
+                cached_parent_id = self._get_cached_protocol_parent_id(protocol_id)
+                if cached_parent_id and cached_parent_id != player.player_id:
+                    self.logger.debug(
+                        "Protocol %s already migrated to new parent %s, skipping cleanup for removed player %s",
+                        protocol_id,
+                        cached_parent_id,
+                        player.player_id,
+                    )
+                    continue
+                # --- FIX END ---
+
                 # Clear cached parent ID in config so protocol won't try to
                 # restore a link to the deleted player on next restart
                 self._clear_protocol_parent_id(protocol_id)
                 if protocol_player := self.get_player(protocol_id):
-                    # Protocol player is available: clear parent and schedule re-evaluation
-                    # so it can be matched to a new parent or a new universal player
-                    protocol_player.set_protocol_parent_id(None)
-                    protocol_player.update_state()
-                    self.logger.debug(
-                        "Player %s removed - scheduling evaluation for protocol %s",
-                        player.player_id,
-                        protocol_id,
-                    )
-                    self._schedule_protocol_evaluation(protocol_player)
+                    # --- FIX START ---
+                    # Only clear the in-memory parent if it is actually pointing to the player being removed
+                    if protocol_player.protocol_parent_id == player.player_id:
+                        protocol_player.set_protocol_parent_id(None)
+                        protocol_player.update_state()
+                        self.logger.debug(
+                            "Player %s removed - scheduling evaluation for protocol %s",
+                            player.player_id,
+                            protocol_id,
+                        )
+                        self._schedule_protocol_evaluation(protocol_player)
+                    # --- FIX END ---
                 else:
                     # Protocol player is not registered yet — it may still be
                     # mid-discovery (e.g., DLNA connecting via SSDP). Don't delete
